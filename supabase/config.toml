@@ -1,0 +1,5 @@
+[functions.generate-survey-instance]
+verify_jwt = false
+
+[functions.captcha]
+verify_jwt = false
