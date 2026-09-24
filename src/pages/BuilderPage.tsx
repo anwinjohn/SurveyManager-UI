@@ -61,6 +61,10 @@ import {
   Info,
   Asterisk,
   AlertTriangle,
+  Smartphone,
+  Monitor,
+  RotateCcw,
+  Sparkles,
 } from 'lucide-react';
 import { api } from '@/services/api';
 import type {
@@ -91,6 +95,12 @@ import {
 } from '@/utils/logic';
 import { Spinner, Modal, Toggle, ProgressBar } from '@/components/ui';
 import type { Page } from '@/components/Sidebar';
+import {
+  IntroScreen,
+  SurveyPageCard,
+  CompletedScreen,
+  validatePageQuestions,
+} from '@/pages/Surveyexperience';
 
 const questionTypeMeta: Record<
   QuestionType,
@@ -3856,72 +3866,18 @@ type AnswerValue =
 
 const PIPE_PLACEHOLDER_PATTERN = /\{piped\}|\$\{answer\}/g;
 
-function applyPiping(
-  title: string,
-  pipeFrom: string | undefined,
-  answers: Record<string, AnswerValue>,
-  allQuestions: Question[]
-): string {
-  if (!pipeFrom) return title;
-  const sourceAnswer = answers[pipeFrom];
-  const hasAnswer = !(
-    sourceAnswer == null ||
-    sourceAnswer === '' ||
-    (Array.isArray(sourceAnswer) && sourceAnswer.length === 0)
-  );
+/* =================== Preview Modal =================== */
+//
+// Renders the exact same components the live, customer-facing
+// SurveyTakePage uses (@/components/SurveyExperience) so a survey designer
+// previewing here sees precisely what respondents will see once the
+// survey is published — same layout, same branding, same piping, skip
+// logic and conditional-required behavior. Only the CAPTCHA and the real
+// submission call are skipped, since those need a live backend; everything
+// else is the real thing.
 
-  if (!hasAnswer) {
-    // The source question hasn't been answered yet (e.g. the very first
-    // render of a preview, or the respondent skipped an optional source
-    // question). Rather than leaking the raw "{piped}" token into the
-    // title, quietly drop the placeholder and tidy up the leftover spacing
-    // so the title still reads as a complete sentence.
-    // (Plain substring checks here on purpose — testing a shared `g`-flag
-    // regex with .test() mutates its lastIndex and misbehaves on repeat
-    // calls; .replace() below is safe since it always resets lastIndex.)
-    if (!title.includes('{piped}') && !title.includes('${answer}'))
-      return title;
-    return title
-      .replace(PIPE_PLACEHOLDER_PATTERN, '')
-      .replace(/\s{2,}/g, ' ')
-      .replace(/\s+([,.!?])/g, '$1')
-      .trim();
-  }
-
-  const sourceQuestion = allQuestions.find((q) => q.id === pipeFrom);
-  let displayValue: string;
-  if (Array.isArray(sourceAnswer)) {
-    if (sourceQuestion?.options) {
-      displayValue = sourceAnswer
-        .map((v) => sourceQuestion.options?.find((o) => o.id === v)?.label || v)
-        .join(', ');
-    } else {
-      displayValue = sourceAnswer.join(', ');
-    }
-  } else if (sourceQuestion?.options) {
-    displayValue =
-      sourceQuestion.options.find((o) => o.id === sourceAnswer)?.label ||
-      String(sourceAnswer);
-  } else {
-    displayValue = String(sourceAnswer);
-  }
-  return title.replace(PIPE_PLACEHOLDER_PATTERN, displayValue);
-}
-
-// A question is required either unconditionally (question.required), or
-// conditionally via requiredRule — the same condition-group shape used by
-// displayRule, evaluated against the answers collected so far. This lets a
-// question stay optional by default and only become mandatory once, say,
-// an earlier "Are you satisfied?" question was answered "No".
-function isQuestionRequired(
-  q: Question,
-  answers: Record<string, AnswerValue>
-): boolean {
-  if (q.required) return true;
-  if (q.requiredRule)
-    return evaluateConditionGroup(q.requiredRule.conditionGroup, answers);
-  return false;
-}
+type PreviewPhase = 'intro' | 'survey' | 'completed';
+type PreviewDevice = 'desktop' | 'mobile';
 
 function PreviewModal({
   survey,
@@ -3930,16 +3886,37 @@ function PreviewModal({
   survey: Survey;
   onClose: () => void;
 }) {
+  const [phase, setPhase] = useState<PreviewPhase>('intro');
   const [currentPageIdx, setCurrentPageIdx] = useState(0);
   const [answers, setAnswers] = useState<Record<string, AnswerValue>>({});
-  const [completed, setCompleted] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const [direction, setDirection] = useState<'forward' | 'back'>('forward');
+  const [device, setDevice] = useState<PreviewDevice>('desktop');
+  const [language, setLanguage] = useState(
+    survey.defaultLanguage || survey.languages[0] || 'en'
+  );
+  const scrollRef = useRef<HTMLDivElement>(null);
 
+  const allQuestions = survey.pages.flatMap((p) => p.questions);
   const page = survey.pages[currentPageIdx];
+  const isLastPage = currentPageIdx === survey.pages.length - 1;
+  const isRTL = ['ar', 'he', 'fa', 'ur'].includes(language);
+  const dir: 'ltr' | 'rtl' = isRTL ? 'rtl' : 'ltr';
+
+  // Preview shows the survey's source text — saved translations aren't
+  // loaded here since they belong to the live page's data layer.
+  function tr(_key: string, fallback: string): string {
+    return fallback;
+  }
+
+  function scrollToTop() {
+    scrollRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
+  }
 
   function setAnswer(qId: string, value: AnswerValue) {
     setAnswers((prev) => ({ ...prev, [qId]: value }));
     setErrors((prev) => {
+      if (!prev[qId]) return prev;
       const next = { ...prev };
       delete next[qId];
       return next;
@@ -3947,1069 +3924,232 @@ function PreviewModal({
   }
 
   function validatePage(): boolean {
-    const errs: Record<string, string> = {};
-    for (const q of page.questions) {
-      if (!shouldDisplayQuestion(q, answers as Record<string, any>)) continue;
-      const answer = answers[q.id];
-      if (isQuestionRequired(q, answers)) {
-        if (
-          answer == null ||
-          answer === '' ||
-          (Array.isArray(answer) && answer.length === 0)
-        ) {
-          errs[q.id] = 'This question is required';
-        }
-      }
-      if (
-        q.type === 'text' &&
-        q.validation &&
-        q.validation !== 'none' &&
-        answer
-      ) {
-        const val = String(answer);
-        if (
-          q.validation === 'email' &&
-          !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(val)
-        ) {
-          errs[q.id] = 'Please enter a valid email address';
-        }
-        if (q.validation === 'phone' && !/^[\d\s+()-]{7,}$/.test(val)) {
-          errs[q.id] = 'Please enter a valid phone number';
-        }
-        if (q.validation === 'url' && !/^https?:\/\/.+/.test(val)) {
-          errs[q.id] = 'Please enter a valid URL';
-        }
-        if (q.validation === 'number' && isNaN(Number(val))) {
-          errs[q.id] = 'Please enter a valid number';
-        }
-      }
-    }
+    if (!page) return true;
+    const errs = validatePageQuestions(
+      page.questions,
+      answers as Record<string, any>,
+      shouldDisplayQuestion
+    );
     setErrors(errs);
     return Object.keys(errs).length === 0;
   }
 
   function handleNext() {
-    if (!validatePage()) return;
+    if (!validatePage()) {
+      scrollToTop();
+      return;
+    }
+    if (!page) return;
     const skipTarget = evaluateSkipRules(page, answers as Record<string, any>);
     if (skipTarget) {
       const targetIdx = survey.pages.findIndex((p) => p.id === skipTarget);
       if (targetIdx >= 0) {
+        setDirection('forward');
         setCurrentPageIdx(targetIdx);
+        scrollToTop();
         return;
       }
     }
-    if (currentPageIdx < survey.pages.length - 1) {
-      setCurrentPageIdx(currentPageIdx + 1);
-    } else {
-      setCompleted(true);
+    if (isLastPage) {
+      setPhase('completed');
+      scrollToTop();
+      return;
     }
+    setDirection('forward');
+    setCurrentPageIdx((i) => i + 1);
+    scrollToTop();
   }
 
-  function handlePrev() {
-    if (currentPageIdx > 0) {
-      setCurrentPageIdx(currentPageIdx - 1);
+  function handleBack() {
+    if (currentPageIdx === 0) {
+      setPhase('intro');
+      scrollToTop();
+      return;
     }
+    setDirection('back');
+    setCurrentPageIdx((i) => i - 1);
+    scrollToTop();
   }
 
-  if (completed) {
-    return (
-      <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-        <div
-          className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm animate-fade-in"
-          onClick={onClose}
-        />
-        <div
-          className="relative w-full max-w-lg bg-white rounded-2xl shadow-xl animate-slide-up overflow-hidden text-center py-12 px-8"
-          style={{ fontFamily: survey.branding.fontFamily }}
-        >
-          <div
-            className="w-16 h-16 rounded-2xl mx-auto mb-5 flex items-center justify-center"
-            style={{ backgroundColor: `${survey.branding.primaryColor}15` }}
-          >
-            <PartyPopper
-              className="w-8 h-8"
-              style={{ color: survey.branding.primaryColor }}
-            />
-          </div>
-          <h2 className="text-xl font-bold font-display text-slate-900 mb-2">
-            Thank you!
-          </h2>
-          <p className="text-sm text-slate-500 mb-6">
-            Your response has been recorded.
-          </p>
-          <div className="bg-slate-50 rounded-xl p-4 text-left mb-6">
-            <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">
-              Your Answers ({Object.keys(answers).length})
-            </p>
-            <div className="space-y-2 max-h-48 overflow-y-auto scrollbar-thin">
-              {survey.pages
-                .flatMap((p) => p.questions)
-                .map((q) => {
-                  const ans = answers[q.id];
-                  if (ans == null) return null;
-                  const ansStr = Array.isArray(ans)
-                    ? ans.join(', ')
-                    : typeof ans === 'object'
-                      ? Object.values(ans).join(', ')
-                      : String(ans);
-                  return (
-                    <div key={q.id} className="text-xs">
-                      <span className="text-slate-500">
-                        {q.title.slice(0, 40)}:{' '}
-                      </span>
-                      <span className="font-medium text-slate-700">
-                        {ansStr}
-                      </span>
-                    </div>
-                  );
-                })}
-            </div>
-          </div>
-          <button
-            onClick={onClose}
-            className="btn-primary"
-            style={{ backgroundColor: survey.branding.primaryColor }}
-          >
-            Close Preview
-          </button>
-        </div>
-      </div>
-    );
+  function handleRestart() {
+    setPhase('intro');
+    setCurrentPageIdx(0);
+    setAnswers({});
+    setErrors({});
+    setDirection('forward');
+    scrollToTop();
   }
 
-  const isLast = currentPageIdx === survey.pages.length - 1;
+  const frameWidthClass = device === 'mobile' ? 'max-w-[420px]' : 'max-w-full';
 
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center p-4 overflow-y-auto">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div
-        className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm animate-fade-in"
+        className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm animate-fade-in"
         onClick={onClose}
       />
-      <div className="relative w-full max-w-2xl bg-white rounded-2xl shadow-xl my-8 animate-slide-up overflow-hidden">
-        <div
-          className="px-8 py-6"
-          style={{
-            backgroundColor: `${survey.branding.primaryColor}08`,
-            borderBottom: `1px solid ${survey.branding.primaryColor}20`,
-          }}
-        >
-          <div className="flex items-center justify-between">
-            <h2
-              className="text-xl font-bold font-display"
-              style={{ color: survey.branding.primaryColor }}
+      <div className="relative w-full max-w-5xl h-[90vh] bg-slate-100 rounded-2xl shadow-2xl overflow-hidden flex flex-col animate-slide-up">
+        {/* Toolbar */}
+        <div className="flex items-center justify-between gap-3 px-5 py-3 bg-white border-b border-slate-200 flex-shrink-0">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-sky-50 text-sky-600 text-xs font-semibold flex-shrink-0">
+              <Sparkles className="w-3.5 h-3.5" /> Live Preview
+            </span>
+            <span className="text-xs text-slate-400 hidden sm:inline truncate">
+              This is exactly what respondents will see — CAPTCHA and submission
+              are simulated.
+            </span>
+          </div>
+          <div className="flex items-center gap-2 flex-shrink-0">
+            {survey.languages.length > 1 && (
+              <select
+                value={language}
+                onChange={(e) => setLanguage(e.target.value)}
+                className="text-xs font-medium border border-slate-200 rounded-lg px-2 py-1.5 bg-white text-slate-600"
+              >
+                {survey.languages.map((lang) => (
+                  <option key={lang} value={lang}>
+                    {lang.toUpperCase()}
+                  </option>
+                ))}
+              </select>
+            )}
+            <div className="flex items-center rounded-lg border border-slate-200 p-0.5 bg-slate-50">
+              <button
+                onClick={() => setDevice('desktop')}
+                className={`p-1.5 rounded-md transition ${device === 'desktop' ? 'bg-white shadow-sm text-slate-700' : 'text-slate-400 hover:text-slate-600'}`}
+                title="Desktop width"
+              >
+                <Monitor className="w-4 h-4" />
+              </button>
+              <button
+                onClick={() => setDevice('mobile')}
+                className={`p-1.5 rounded-md transition ${device === 'mobile' ? 'bg-white shadow-sm text-slate-700' : 'text-slate-400 hover:text-slate-600'}`}
+                title="Mobile width"
+              >
+                <Smartphone className="w-4 h-4" />
+              </button>
+            </div>
+            <button
+              onClick={handleRestart}
+              className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition"
+              title="Restart preview"
             >
-              {survey.title}
-            </h2>
+              <RotateCcw className="w-4 h-4" />
+            </button>
             <button
               onClick={onClose}
-              className="text-slate-400 hover:text-slate-600"
+              className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition"
+              title="Close preview"
             >
-              <X className="w-5 h-5" />
+              <X className="w-4 h-4" />
             </button>
-          </div>
-          <p className="text-sm text-slate-500 mt-1">{survey.description}</p>
-          <div className="flex items-center gap-1.5 mt-4">
-            {survey.pages.map((_, i) => (
-              <div
-                key={i}
-                className="h-1.5 rounded-full transition-all"
-                style={{
-                  width: i === currentPageIdx ? 32 : 12,
-                  backgroundColor:
-                    i <= currentPageIdx
-                      ? survey.branding.primaryColor
-                      : '#e2e8f0',
-                }}
-              />
-            ))}
           </div>
         </div>
 
+        {/* Frame */}
         <div
-          className="px-8 py-8"
-          style={{ fontFamily: survey.branding.fontFamily }}
+          className="flex-1 overflow-y-auto scrollbar-thin bg-slate-100 px-4 py-6"
+          ref={scrollRef}
         >
-          <p className="text-xs text-slate-400 mb-1">
-            Page {currentPageIdx + 1} of {survey.pages.length}
-          </p>
-          <h3 className="text-lg font-semibold text-slate-900 mb-6">
-            {page.title}
-          </h3>
-
-          <div className="space-y-6">
-            {page.questions
-              .filter((q) =>
-                shouldDisplayQuestion(q, answers as Record<string, any>)
-              )
-              .map((q) => (
-                <InteractiveQuestion
-                  key={q.id}
-                  question={q}
-                  answer={answers[q.id]}
-                  error={errors[q.id]}
-                  primaryColor={survey.branding.primaryColor}
-                  accentColor={survey.branding.accentColor}
-                  allAnswers={answers}
-                  allQuestions={survey.pages.flatMap((p) => p.questions)}
-                  onAnswer={(val) => setAnswer(q.id, val)}
+          <div
+            className={`mx-auto transition-all duration-300 ${frameWidthClass}`}
+          >
+            <div className="rounded-2xl overflow-hidden shadow-lg border border-slate-200 bg-white">
+              {phase === 'intro' && (
+                <IntroScreen
+                  survey={survey}
+                  language={language}
+                  languages={survey.languages}
+                  onLanguageChange={setLanguage}
+                  greeting="Hi there, we'd love your feedback."
+                  dir={dir}
+                  tr={tr}
+                  questionCount={allQuestions.length}
+                  onStart={() => {
+                    setPhase('survey');
+                    scrollToTop();
+                  }}
+                  heightClass="min-h-[600px]"
                 />
-              ))}
-          </div>
-
-          <div className="flex items-center justify-between mt-8 pt-6 border-t border-slate-100">
-            <button
-              onClick={handlePrev}
-              disabled={currentPageIdx === 0}
-              className="btn-secondary"
-            >
-              <ArrowLeft className="w-4 h-4" /> Previous
-            </button>
-            {isLast ? (
-              <button
-                onClick={handleNext}
-                className="btn-primary"
-                style={{ backgroundColor: survey.branding.primaryColor }}
-              >
-                <Check className="w-4 h-4" /> Submit
-              </button>
-            ) : (
-              <button
-                onClick={handleNext}
-                className="btn-primary"
-                style={{ backgroundColor: survey.branding.primaryColor }}
-              >
-                Next <ChevronRight className="w-4 h-4" />
-              </button>
-            )}
+              )}
+              {phase === 'survey' && (
+                <SurveyPageCard
+                  survey={survey}
+                  currentPage={page}
+                  currentPageIndex={currentPageIdx}
+                  totalPages={survey.pages.length}
+                  isLastPage={isLastPage}
+                  answers={answers as Record<string, any>}
+                  errors={errors}
+                  direction={direction}
+                  dir={dir}
+                  isRTL={isRTL}
+                  language={language}
+                  languages={survey.languages}
+                  onLanguageChange={setLanguage}
+                  tr={tr}
+                  allQuestions={allQuestions}
+                  shouldDisplayQuestion={shouldDisplayQuestion}
+                  onAnswer={(qId, val) => setAnswer(qId, val)}
+                  onBack={handleBack}
+                  onNext={handleNext}
+                  heightClass="min-h-[600px]"
+                />
+              )}
+              {phase === 'completed' && (
+                <>
+                  <CompletedScreen
+                    survey={survey}
+                    language={language}
+                    dir={dir}
+                    heightClass="min-h-[420px]"
+                  />
+                  <div className="border-t border-slate-200 bg-slate-50 p-6">
+                    <div className="flex items-center justify-between mb-3">
+                      <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider">
+                        Captured answers ({Object.keys(answers).length})
+                      </p>
+                      <button
+                        onClick={handleRestart}
+                        className="btn-secondary text-xs"
+                      >
+                        <RotateCcw className="w-3.5 h-3.5" /> Restart preview
+                      </button>
+                    </div>
+                    <div className="space-y-1.5 max-h-48 overflow-y-auto scrollbar-thin bg-white rounded-lg border border-slate-200 p-3">
+                      {allQuestions.map((q) => {
+                        const ans = answers[q.id];
+                        if (ans == null) return null;
+                        const ansStr = Array.isArray(ans)
+                          ? ans.join(', ')
+                          : typeof ans === 'object'
+                            ? Object.values(ans as object).join(', ')
+                            : String(ans);
+                        return (
+                          <div key={q.id} className="text-xs flex gap-2">
+                            <span className="text-slate-400 flex-shrink-0">
+                              {q.title.slice(0, 40)}:
+                            </span>
+                            <span className="font-medium text-slate-700">
+                              {ansStr}
+                            </span>
+                          </div>
+                        );
+                      })}
+                      {Object.keys(answers).length === 0 && (
+                        <p className="text-xs text-slate-400 italic">
+                          No answers were entered in this preview.
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
           </div>
         </div>
       </div>
-    </div>
-  );
-}
-
-/* =================== Interactive Question (Preview) =================== */
-
-function InteractiveQuestion({
-  question: q,
-  answer,
-  error,
-  primaryColor,
-  accentColor,
-  allAnswers,
-  allQuestions,
-  onAnswer,
-}: {
-  question: Question;
-  answer: AnswerValue;
-  error?: string;
-  primaryColor: string;
-  accentColor: string;
-  allAnswers: Record<string, AnswerValue>;
-  allQuestions: Question[];
-  onAnswer: (val: AnswerValue) => void;
-}) {
-  const displayTitle = applyPiping(
-    q.title,
-    q.pipeFrom,
-    allAnswers,
-    allQuestions
-  );
-
-  return (
-    <div>
-      <label className="block text-sm font-medium text-slate-700 mb-2">
-        {displayTitle}
-        {isQuestionRequired(q, allAnswers) && (
-          <span className="text-red-500 ml-1">*</span>
-        )}
-      </label>
-      {q.description && (
-        <p className="text-xs text-slate-400 mb-3">{q.description}</p>
-      )}
-      {error && (
-        <p className="text-xs text-red-500 mb-2 flex items-center gap-1">
-          <AlertCircle className="w-3.5 h-3.5" /> {error}
-        </p>
-      )}
-
-      {(q.type === 'single-choice' ||
-        q.type === 'dropdown' ||
-        q.type === 'yes-no' ||
-        q.type === 'true-false') &&
-        q.options &&
-        (q.type === 'dropdown' ? (
-          <select
-            value={String(answer ?? '')}
-            onChange={(e) => onAnswer(e.target.value)}
-            className="input"
-          >
-            <option value="">Select an option...</option>
-            {q.options.map((o) => (
-              <option key={o.id} value={o.label}>
-                {o.label}
-              </option>
-            ))}
-          </select>
-        ) : (
-          <div className="space-y-2">
-            {q.options.map((o) => (
-              <label
-                key={o.id}
-                className={`flex items-center gap-2.5 p-2.5 rounded-lg border cursor-pointer transition ${
-                  answer === o.label
-                    ? 'border-2'
-                    : 'border border-slate-200 hover:border-slate-300'
-                }`}
-                style={
-                  answer === o.label
-                    ? {
-                        borderColor: primaryColor,
-                        backgroundColor: `${primaryColor}08`,
-                      }
-                    : {}
-                }
-              >
-                <input
-                  type="radio"
-                  name={q.id}
-                  checked={answer === o.label}
-                  onChange={() => onAnswer(o.label)}
-                  className="accent-sky-500"
-                  style={{ accentColor: primaryColor }}
-                />
-                <span className="text-sm text-slate-700">{o.label}</span>
-              </label>
-            ))}
-          </div>
-        ))}
-
-      {(q.type === 'multiple-choice' || q.type === 'multi-select-dropdown') &&
-        q.options &&
-        (q.type === 'multi-select-dropdown' ? (
-          <select
-            multiple
-            value={(Array.isArray(answer) ? answer : []).map(String)}
-            onChange={(e) =>
-              onAnswer(Array.from(e.target.selectedOptions).map((o) => o.value))
-            }
-            className="input min-h-[120px]"
-          >
-            {q.options.map((o) => (
-              <option key={o.id} value={o.label}>
-                {o.label}
-              </option>
-            ))}
-          </select>
-        ) : (
-          <div className="space-y-2">
-            {q.options.map((o) => {
-              const selected =
-                Array.isArray(answer) && answer.includes(o.label);
-              return (
-                <label
-                  key={o.id}
-                  className={`flex items-center gap-2.5 p-2.5 rounded-lg border cursor-pointer transition ${
-                    selected
-                      ? 'border-2'
-                      : 'border border-slate-200 hover:border-slate-300'
-                  }`}
-                  style={
-                    selected
-                      ? {
-                          borderColor: primaryColor,
-                          backgroundColor: `${primaryColor}08`,
-                        }
-                      : {}
-                  }
-                >
-                  <input
-                    type="checkbox"
-                    checked={selected}
-                    onChange={(e) => {
-                      const current = Array.isArray(answer) ? answer : [];
-                      if (e.target.checked) {
-                        onAnswer([...current, o.label]);
-                      } else {
-                        onAnswer(current.filter((v) => v !== o.label));
-                      }
-                    }}
-                    style={{ accentColor: primaryColor }}
-                  />
-                  <span className="text-sm text-slate-700">{o.label}</span>
-                </label>
-              );
-            })}
-          </div>
-        ))}
-
-      {q.type === 'text' && (
-        <input
-          type="text"
-          value={String(answer ?? '')}
-          onChange={(e) => onAnswer(e.target.value)}
-          className="input"
-          placeholder="Type your answer..."
-        />
-      )}
-      {q.type === 'long-text' && (
-        <textarea
-          value={String(answer ?? '')}
-          onChange={(e) => onAnswer(e.target.value)}
-          className="input resize-none"
-          rows={3}
-          placeholder="Type your answer..."
-        />
-      )}
-      {q.type === 'number' && (
-        <input
-          type="number"
-          step="1"
-          value={String(answer ?? '')}
-          onChange={(e) => onAnswer(e.target.value)}
-          className="input"
-          placeholder="Enter a number..."
-        />
-      )}
-      {q.type === 'decimal' && (
-        <input
-          type="number"
-          step="0.01"
-          value={String(answer ?? '')}
-          onChange={(e) => onAnswer(e.target.value)}
-          className="input"
-          placeholder="Enter a decimal..."
-        />
-      )}
-      {q.type === 'email' && (
-        <input
-          type="email"
-          value={String(answer ?? '')}
-          onChange={(e) => onAnswer(e.target.value)}
-          className="input"
-          placeholder="name@example.com"
-        />
-      )}
-      {q.type === 'phone' && (
-        <input
-          type="tel"
-          value={String(answer ?? '')}
-          onChange={(e) => onAnswer(e.target.value)}
-          className="input"
-          placeholder="+1 (555) 000-0000"
-        />
-      )}
-      {q.type === 'url' && (
-        <input
-          type="url"
-          value={String(answer ?? '')}
-          onChange={(e) => onAnswer(e.target.value)}
-          className="input"
-          placeholder="https://..."
-        />
-      )}
-      {q.type === 'date' && (
-        <input
-          type="date"
-          value={String(answer ?? '')}
-          onChange={(e) => onAnswer(e.target.value)}
-          className="input"
-        />
-      )}
-      {q.type === 'datetime' && (
-        <input
-          type="datetime-local"
-          value={String(answer ?? '')}
-          onChange={(e) => onAnswer(e.target.value)}
-          className="input"
-        />
-      )}
-      {q.type === 'time' && (
-        <input
-          type="time"
-          value={String(answer ?? '')}
-          onChange={(e) => onAnswer(e.target.value)}
-          className="input"
-        />
-      )}
-      {q.type === 'file-upload' && (
-        <div className="border-2 border-dashed border-slate-200 rounded-xl p-6 text-center">
-          <Upload className="w-6 h-6 text-slate-300 mx-auto mb-2" />
-          <p className="text-sm text-slate-400">Click or drag to upload</p>
-          {q.maxFileSize && (
-            <p className="text-xs text-slate-300 mt-1">Max {q.maxFileSize}MB</p>
-          )}
-        </div>
-      )}
-
-      {/* Star Rating */}
-      {q.type === 'rating' && (
-        <div className="flex items-center gap-1.5">
-          {Array.from({ length: q.max || 5 }, (_, i) => i + 1).map((n) => (
-            <button
-              key={n}
-              type="button"
-              onClick={() => onAnswer(n)}
-              className="p-1 transition-transform hover:scale-110"
-            >
-              <Star
-                className="w-7 h-7 transition-colors"
-                style={{
-                  color: n <= Number(answer) ? primaryColor : '#cbd5e1',
-                }}
-                fill={n <= Number(answer) ? primaryColor : 'none'}
-              />
-            </button>
-          ))}
-        </div>
-      )}
-
-      {/* Numeric Rating */}
-      {q.type === 'numeric-rating' && (
-        <div className="flex items-center gap-2">
-          {Array.from(
-            { length: (q.max || 5) - (q.min || 1) + 1 },
-            (_, i) => i + (q.min || 1)
-          ).map((n) => (
-            <button
-              key={n}
-              type="button"
-              onClick={() => onAnswer(n)}
-              className={`w-10 h-10 rounded-lg border text-sm font-medium transition hover:scale-110 ${answer === n ? 'text-white' : ''}`}
-              style={
-                answer === n
-                  ? { backgroundColor: primaryColor, borderColor: primaryColor }
-                  : { borderColor: '#e2e8f0', color: primaryColor }
-              }
-            >
-              {n}
-            </button>
-          ))}
-        </div>
-      )}
-
-      {/* Emoji Rating */}
-      {q.type === 'emoji-rating' &&
-        (q.emojiSet || ['😕', '😐', '🙂', '😀', '😄']).map((emoji, i) => (
-          <div key={i} className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => onAnswer(i + 1)}
-              className={`text-3xl p-2 rounded-lg border transition hover:scale-110 ${answer === i + 1 ? 'border-2' : 'border border-slate-200'}`}
-              style={
-                answer === i + 1
-                  ? {
-                      borderColor: primaryColor,
-                      backgroundColor: `${primaryColor}08`,
-                    }
-                  : {}
-              }
-            >
-              {emoji}
-            </button>
-          </div>
-        ))}
-
-      {/* NPS */}
-      {q.type === 'nps' && (
-        <div>
-          <div className="flex items-center gap-1.5">
-            {Array.from({ length: 11 }, (_, i) => i).map((n) => (
-              <button
-                key={n}
-                onClick={() => onAnswer(n)}
-                className={`w-9 h-9 rounded-lg border text-sm font-medium transition hover:scale-110 ${answer === n ? 'text-white' : ''}`}
-                style={
-                  answer === n
-                    ? {
-                        backgroundColor:
-                          n >= 9 ? accentColor : n <= 6 ? '#ef4444' : '#64748b',
-                        borderColor: 'transparent',
-                      }
-                    : {
-                        borderColor: `${primaryColor}40`,
-                        color:
-                          n >= 9 ? accentColor : n <= 6 ? '#ef4444' : '#64748b',
-                      }
-                }
-              >
-                {n}
-              </button>
-            ))}
-          </div>
-          <div className="flex items-center justify-between text-xs text-slate-400 mt-1.5">
-            <span>Detractors</span>
-            <span>Passives</span>
-            <span>Promoters</span>
-          </div>
-        </div>
-      )}
-
-      {/* Slider */}
-      {q.type === 'slider' && (
-        <div>
-          <input
-            type="range"
-            min={q.min || 0}
-            max={q.max || 100}
-            step={q.step || 1}
-            value={Number(answer ?? (q.min || 0))}
-            onChange={(e) => onAnswer(Number(e.target.value))}
-            className="w-full"
-            style={{ accentColor: primaryColor }}
-          />
-          <div className="flex items-center justify-between text-xs text-slate-400 mt-1">
-            <span>{q.min || 0}</span>
-            <span
-              className="font-semibold text-slate-600"
-              style={{ color: primaryColor }}
-            >
-              Current: {Number(answer ?? (q.min || 0))}
-            </span>
-            <span>{q.max || 100}</span>
-          </div>
-        </div>
-      )}
-
-      {/* Likert Scale */}
-      {q.type === 'likert-scale' && (
-        <div className="space-y-2">
-          {(
-            q.scaleLabels || [
-              'Strongly Disagree',
-              'Disagree',
-              'Neutral',
-              'Agree',
-              'Strongly Agree',
-            ]
-          ).map((label, i) => (
-            <label
-              key={i}
-              className={`flex items-center gap-2.5 p-2.5 rounded-lg border cursor-pointer transition ${answer === label ? 'border-2' : 'border border-slate-200 hover:border-slate-300'}`}
-              style={
-                answer === label
-                  ? {
-                      borderColor: primaryColor,
-                      backgroundColor: `${primaryColor}08`,
-                    }
-                  : {}
-              }
-            >
-              <input
-                type="radio"
-                name={q.id}
-                checked={answer === label}
-                onChange={() => onAnswer(label)}
-                style={{ accentColor: primaryColor }}
-              />
-              <span className="text-sm text-slate-700">{label}</span>
-            </label>
-          ))}
-        </div>
-      )}
-
-      {/* Matrix */}
-      {(q.type === 'matrix' || q.type === 'matrix-rating') &&
-        q.rows &&
-        q.columns && (
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr>
-                  <th></th>
-                  {q.columns.map((c) => (
-                    <th
-                      key={c}
-                      className="px-2 py-2 text-xs font-medium text-slate-500 text-center"
-                    >
-                      {c}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {q.rows.map((r) => {
-                  const rowAnswer =
-                    typeof answer === 'object' &&
-                    answer !== null &&
-                    !Array.isArray(answer)
-                      ? (answer as Record<string, string>)[r] || ''
-                      : '';
-                  return (
-                    <tr key={r}>
-                      <td className="px-2 py-2 text-sm text-slate-700">{r}</td>
-                      {q.columns!.map((c) => (
-                        <td key={c} className="px-2 py-2 text-center">
-                          <input
-                            type="radio"
-                            name={`${q.id}-${r}`}
-                            checked={rowAnswer === c}
-                            onChange={() => {
-                              const current =
-                                typeof answer === 'object' &&
-                                answer !== null &&
-                                !Array.isArray(answer)
-                                  ? (answer as Record<string, string>)
-                                  : {};
-                              onAnswer({ ...current, [r]: c });
-                            }}
-                            style={{ accentColor: primaryColor }}
-                          />
-                        </td>
-                      ))}
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
-
-      {/* Ranking */}
-      {(q.type === 'ranking' || q.type === 'drag-ranking') && q.options && (
-        <RankingPreview
-          options={q.options}
-          answer={answer}
-          onAnswer={onAnswer}
-        />
-      )}
-
-      {/* Image Selection */}
-      {q.type === 'image-selection' && q.options && (
-        <div className="grid grid-cols-2 gap-3">
-          {q.options.map((o) => (
-            <button
-              key={o.id}
-              type="button"
-              onClick={() => onAnswer(o.label)}
-              className={`rounded-xl border-2 overflow-hidden transition ${answer === o.label ? '' : 'border-slate-200 hover:border-slate-300'}`}
-              style={answer === o.label ? { borderColor: primaryColor } : {}}
-            >
-              <div className="aspect-video bg-slate-100 flex items-center justify-center text-slate-400 text-xs">
-                {o.label}
-              </div>
-              <p className="text-xs text-slate-600 py-1.5 text-center">
-                {o.label}
-              </p>
-            </button>
-          ))}
-        </div>
-      )}
-
-      {/* Signature */}
-      {q.type === 'signature' && (
-        <div className="border-2 border-dashed border-slate-200 rounded-xl p-6 text-center">
-          <PenTool className="w-6 h-6 text-slate-300 mx-auto mb-2" />
-          <p className="text-sm text-slate-400">Sign here</p>
-        </div>
-      )}
-
-      {/* Address */}
-      {q.type === 'address' && (
-        <div className="space-y-2">
-          <input
-            type="text"
-            placeholder="Street Address"
-            className="input"
-            value={(answer as Record<string, string>)?.street || ''}
-            onChange={(e) =>
-              onAnswer({
-                ...((answer as Record<string, string>) || {}),
-                street: e.target.value,
-              })
-            }
-          />
-          <div className="grid grid-cols-2 gap-2">
-            <input
-              type="text"
-              placeholder="City"
-              className="input"
-              value={(answer as Record<string, string>)?.city || ''}
-              onChange={(e) =>
-                onAnswer({
-                  ...((answer as Record<string, string>) || {}),
-                  city: e.target.value,
-                })
-              }
-            />
-            <input
-              type="text"
-              placeholder="State / Province"
-              className="input"
-              value={(answer as Record<string, string>)?.state || ''}
-              onChange={(e) =>
-                onAnswer({
-                  ...((answer as Record<string, string>) || {}),
-                  state: e.target.value,
-                })
-              }
-            />
-          </div>
-          <div className="grid grid-cols-2 gap-2">
-            <input
-              type="text"
-              placeholder="ZIP / Postal Code"
-              className="input"
-              value={(answer as Record<string, string>)?.zip || ''}
-              onChange={(e) =>
-                onAnswer({
-                  ...((answer as Record<string, string>) || {}),
-                  zip: e.target.value,
-                })
-              }
-            />
-            <input
-              type="text"
-              placeholder="Country"
-              className="input"
-              value={(answer as Record<string, string>)?.country || ''}
-              onChange={(e) =>
-                onAnswer({
-                  ...((answer as Record<string, string>) || {}),
-                  country: e.target.value,
-                })
-              }
-            />
-          </div>
-        </div>
-      )}
-
-      {/* Location */}
-      {q.type === 'location' && (
-        <div className="border-2 border-dashed border-slate-200 rounded-xl p-6 text-center">
-          <MapPin className="w-6 h-6 text-slate-300 mx-auto mb-2" />
-          <p className="text-sm text-slate-400">Location capture</p>
-        </div>
-      )}
-
-      {/* Contact Info */}
-      {q.type === 'contact-info' && (
-        <div className="space-y-2">
-          <input
-            type="text"
-            placeholder="Full Name"
-            className="input"
-            value={(answer as Record<string, string>)?.name || ''}
-            onChange={(e) =>
-              onAnswer({
-                ...((answer as Record<string, string>) || {}),
-                name: e.target.value,
-              })
-            }
-          />
-          <input
-            type="email"
-            placeholder="Email Address"
-            className="input"
-            value={(answer as Record<string, string>)?.email || ''}
-            onChange={(e) =>
-              onAnswer({
-                ...((answer as Record<string, string>) || {}),
-                email: e.target.value,
-              })
-            }
-          />
-          <input
-            type="tel"
-            placeholder="Phone Number"
-            className="input"
-            value={(answer as Record<string, string>)?.phone || ''}
-            onChange={(e) =>
-              onAnswer({
-                ...((answer as Record<string, string>) || {}),
-                phone: e.target.value,
-              })
-            }
-          />
-        </div>
-      )}
-
-      {/* CSAT */}
-      {q.type === 'customer-satisfaction' && (
-        <div>
-          <div className="flex items-center gap-1.5">
-            {Array.from({ length: 5 }, (_, i) => i + 1).map((n) => (
-              <button
-                key={n}
-                type="button"
-                onClick={() => onAnswer(n)}
-                className={`p-1 transition-transform hover:scale-110`}
-              >
-                <Heart
-                  className="w-7 h-7 transition-colors"
-                  style={{ color: n <= Number(answer) ? '#ec4899' : '#cbd5e1' }}
-                  fill={n <= Number(answer) ? '#ec4899' : 'none'}
-                />
-              </button>
-            ))}
-          </div>
-          <div className="flex items-center justify-between text-xs text-slate-400 mt-1.5">
-            <span>Very Dissatisfied</span>
-            <span>Very Satisfied</span>
-          </div>
-        </div>
-      )}
-
-      {/* CES */}
-      {q.type === 'customer-effort' && (
-        <div>
-          <div className="flex items-center gap-1.5">
-            {Array.from({ length: 7 }, (_, i) => i + 1).map((n) => (
-              <button
-                key={n}
-                type="button"
-                onClick={() => onAnswer(n)}
-                className={`w-9 h-9 rounded-lg border text-sm font-medium transition hover:scale-110 ${answer === n ? 'text-white' : ''}`}
-                style={
-                  answer === n
-                    ? {
-                        backgroundColor:
-                          n <= 2 ? '#22c55e' : n >= 5 ? '#ef4444' : '#f59e0b',
-                        borderColor: 'transparent',
-                      }
-                    : { borderColor: '#e2e8f0' }
-                }
-              >
-                {n}
-              </button>
-            ))}
-          </div>
-          <div className="flex items-center justify-between text-xs text-slate-400 mt-1.5">
-            <span>Strongly Disagree</span>
-            <span>Strongly Agree</span>
-          </div>
-        </div>
-      )}
-
-      {/* Semantic Differential */}
-      {q.type === 'semantic-differential' && q.options && (
-        <div className="space-y-3">
-          {q.options.map((pair, pIdx) => (
-            <div key={pair.id}>
-              <div className="flex items-center justify-between text-xs text-slate-500 mb-1">
-                <span>{pair.label}</span>
-                <span>
-                  {q.options?.[(pIdx + 1) % q.options.length]?.label || ''}
-                </span>
-              </div>
-              <input
-                type="range"
-                min={1}
-                max={7}
-                step={1}
-                value={Number(
-                  (answer as unknown as Record<string, number>)?.[pair.id] ?? 4
-                )}
-                onChange={(e) =>
-                  onAnswer({
-                    ...((answer as unknown as Record<string, number>) || {}),
-                    [pair.id]: Number(e.target.value),
-                  })
-                }
-                className="w-full"
-                style={{ accentColor: primaryColor }}
-              />
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function RankingPreview({
-  options,
-  answer,
-  onAnswer,
-}: {
-  options: { id: string; label: string }[];
-  answer: AnswerValue;
-  onAnswer: (val: AnswerValue) => void;
-}) {
-  const ranked = Array.isArray(answer) ? answer : [];
-  const unranked = options.filter((o) => !ranked.includes(o.label));
-
-  function moveUp(idx: number) {
-    if (idx <= 0) return;
-    const next = [...ranked];
-    [next[idx - 1], next[idx]] = [next[idx], next[idx - 1]];
-    onAnswer(next);
-  }
-
-  function moveDown(idx: number) {
-    if (idx >= ranked.length - 1) return;
-    const next = [...ranked];
-    [next[idx], next[idx + 1]] = [next[idx + 1], next[idx]];
-    onAnswer(next);
-  }
-
-  function add(label: string) {
-    onAnswer([...ranked, label]);
-  }
-
-  function remove(label: string) {
-    onAnswer(ranked.filter((r) => r !== label));
-  }
-
-  return (
-    <div className="space-y-3">
-      {ranked.length > 0 && (
-        <div className="space-y-1.5">
-          {ranked.map((label, idx) => {
-            const opt = options.find((o) => o.label === label);
-            return (
-              <div
-                key={label}
-                className="flex items-center gap-3 p-3 rounded-lg border-2 border-sky-200 bg-sky-50/50"
-              >
-                <div className="w-6 h-6 rounded-full bg-sky-500 text-white flex items-center justify-center text-xs font-bold">
-                  {idx + 1}
-                </div>
-                <span className="text-sm text-slate-700 flex-1">
-                  {opt?.label || label}
-                </span>
-                <button
-                  onClick={() => moveUp(idx)}
-                  disabled={idx === 0}
-                  className="w-6 h-6 rounded flex items-center justify-center text-slate-400 hover:bg-slate-100 disabled:opacity-30"
-                >
-                  <ChevronRight className="w-3.5 h-3.5 rotate-[-90deg]" />
-                </button>
-                <button
-                  onClick={() => moveDown(idx)}
-                  disabled={idx === ranked.length - 1}
-                  className="w-6 h-6 rounded flex items-center justify-center text-slate-400 hover:bg-slate-100 disabled:opacity-30"
-                >
-                  <ChevronRight className="w-3.5 h-3.5 rotate-90" />
-                </button>
-                <button
-                  onClick={() => remove(label)}
-                  className="w-6 h-6 rounded flex items-center justify-center text-slate-400 hover:bg-red-50 hover:text-red-500"
-                >
-                  <X className="w-3.5 h-3.5" />
-                </button>
-              </div>
-            );
-          })}
-        </div>
-      )}
-      {unranked.length > 0 && (
-        <div>
-          <p className="text-xs text-slate-400 mb-1.5">Click to rank:</p>
-          <div className="space-y-1">
-            {unranked.map((o) => (
-              <button
-                key={o.id}
-                onClick={() => add(o.label)}
-                className="flex items-center gap-3 p-3 rounded-lg border border-slate-200 hover:border-slate-300 hover:bg-slate-50 transition w-full text-left"
-              >
-                <Plus className="w-3.5 h-3.5 text-slate-400" />
-                <span className="text-sm text-slate-600">{o.label}</span>
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
     </div>
   );
 }
